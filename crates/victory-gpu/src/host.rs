@@ -1336,13 +1336,76 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
+    copy_around_holes(dst, src as usize, len);
+}
+
+/// Copies title memory some of which is unmapped, which reads as zeros.
+///
+/// The unmapped parts are skipped a region at a time: a kernel read that
+/// fails costs ~7 us, so trying each of their pages took much of the
+/// world's copy time (15,000 to 37,000 failed reads per frame). What is
+/// mapped is read first and asked about only where a read stopped: asking
+/// is cheap in an unmapped region and slow in a big mapped one.
+fn copy_around_holes(dst: *mut u8, start: usize, len: usize) {
+    let end = start + len;
+    let to = |at: usize| dst.wrapping_add(at - start);
+    let mut at = start;
+    while at < end {
+        at += read_some(at as *const u8, to(at), end - at);
+        if at >= end {
+            return;
+        }
+        let (mut mapped, until) = region(at);
+        let mut until = until.min(end);
+        if mapped {
+            // It stopped short of the hole (or the hole was mapped since):
+            // this much is mapped; by pages if that changed again.
+            if !read(at as *const u8, to(at), until - at) {
+                copy_by_pages(to(at), at, until - at);
+            }
+            at = until;
+        }
+        while !mapped {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, (until - at) as u64);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { to(at).write_bytes(0, until - at) };
+            at = until;
+            if at >= end {
+                return;
+            }
+            (mapped, until) = region(at);
+            until = until.min(end);
+        }
+    }
+}
+
+const KERNEL_PAGE: usize = 4 << 10;
+
+/// Whether `at` is mapped memory one can read, and where memory in that
+/// state ends (after `at`).
+fn region(at: usize) -> (bool, usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 {
+        return (false, (at / KERNEL_PAGE + 1) * KERNEL_PAGE);
+    }
+    let mapped = info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0;
+    (mapped, info.BaseAddress as usize + info.RegionSize)
+}
+
+/// Copies `[start, start + len)` by 64 KiB, and by 4 KiB in a piece that
+/// fails: zeros for what cannot be read.
+fn copy_by_pages(dst: *mut u8, start: usize, len: usize) {
+    for_pieces(start, len, 64 << 10, |at, n| {
+        if !read(at as *const u8, dst.wrapping_add(at - start), n) {
+            for_pieces(at, n, KERNEL_PAGE, |at, n| {
+                let to = dst.wrapping_add(at - start);
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
@@ -1354,6 +1417,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     });
 }
 
+#[cfg(test)]
+mod hole_tests;
+
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
@@ -1363,12 +1429,18 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    read_some(src, dst, len) == len
+}
+
+/// As [`read`]: the bytes copied, all of them only if it succeeded.
+fn read_some(src: *const u8, dst: *mut u8, len: usize) -> usize {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let whole = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 };
+    if whole { len } else { done.min(len.saturating_sub(1)) }
 }
 
 /// Copies host memory into title memory after a submission (what shaders
