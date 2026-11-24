@@ -1283,6 +1283,21 @@ impl Batch {
     }
 }
 
+#[cfg(test)]
+mod destination_tests;
+
+/// Whether all of `[at, at + len)` is mapped memory one can read, found by
+/// having the kernel read a byte of each page (which leaves guard pages
+/// alone): the title's copies are of a few hundred bytes mostly, and asking
+/// for the state of a big pool's memory took 2 ms for each.
+fn all_readable(at: *const u8, len: usize) -> bool {
+    let (mut byte, mut all) = (0, true);
+    for_pieces(at as usize, len, 4 << 10, |at, _| {
+        all = all && read(at as *const u8, &mut byte, 1);
+    });
+    all
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
@@ -1303,7 +1318,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         2 => return,
         _ => {}
     }
-    if len == 0 || title_dst && !crate::texture::committed(dst, len) {
+    if len == 0 || title_dst && !all_readable(dst, len) {
         return;
     }
     if title_dst {
