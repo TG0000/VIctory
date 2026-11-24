@@ -257,6 +257,18 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// Properties of the handle whose dimensions are a buffer descriptor's record
+/// count: elements where the title's view has a stride, bytes for a raw one
+/// (stride 1 in the metadata). A raw handle to a structured view is a
+/// mismatch: WARP answers with bytes, an AMD driver with elements.
+fn record_view(stride: u32, uav: u32) -> Result<(u32, u32), Why> {
+    match stride {
+        1 => Ok((11 | uav, 0)),
+        4..=2048 if stride.is_multiple_of(4) => Ok((12 | uav, stride)),
+        _ => Err("a structured buffer of unknown stride"),
+    }
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -2999,7 +3011,12 @@ impl<'a> Lower<'a> {
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                     return Err("a constant buffer's descriptor read as data");
                 }
-                ((11 | u, 0), None)
+                // The entry must be this very descriptor's: its stride tells
+                // what the record count counts.
+                let used = used
+                    .filter(|used| used.dwords == 4 && self.names(used, site, first))
+                    .ok_or("the size of a buffer the metadata does not name")?;
+                (record_view(used.stride, u)?, None)
             }
             _ => return Err("a scalar memory read as data"),
         };
@@ -3302,6 +3319,17 @@ impl<'a> Lower<'a> {
                     && u.table_offset_dwords <= dword
             })
             .max_by_key(|u| u.table_offset_dwords)
+    }
+
+    /// Whether `used` starts at dword `first` of what the load at `site`
+    /// reads (not at the start of an array that a computed index reads from,
+    /// nor at an earlier entry).
+    fn names(&self, used: &UsedResource, site: Site, first: u8) -> bool {
+        self.scalar.get(&site).is_some_and(|a| {
+            a.dynamic.is_none()
+                && a.offset.is_multiple_of(4)
+                && used.table_offset_dwords == a.offset / 4 + u32::from(first)
+        })
     }
 
     /// A handle for the descriptor `src` read at `site`.
@@ -7230,7 +7258,7 @@ mod tests {
                 root: RootType::Table,
                 table_offset_dwords: 0,
                 lower_bound: 0,
-                stride: 0,
+                stride: 1,
                 dwords: 4,
                 user_data: 0,
                 slot: 0,
