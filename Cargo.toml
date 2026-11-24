@@ -38,6 +38,8 @@ windows-core = "0.62.2"
 blake3 = "1.8.7"
 memchr = "2.8.3"
 miniz_oxide = "0.9.1"
+# XXH3, to notice changed texture memory (MIT, pure Rust).
+twox-hash = { version = "2.1.5", default-features = false, features = ["std", "xxhash3_128"] }
 walkdir = "2.5.1"
 tempfile = "3.27.0"
 # Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).

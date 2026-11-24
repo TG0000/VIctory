@@ -11,6 +11,7 @@ publish.workspace = true
 blake3.workspace = true
 miniz_oxide.workspace = true
 tracing.workspace = true
+twox-hash.workspace = true
 anyhow.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true

@@ -30,6 +30,17 @@ macro_rules! once {
     }};
 }
 
+/// Tells a texture's contents from what it held before. Nothing is looked up
+/// by it and nobody picks contents to collide, so it need not be
+/// cryptographic: the world checks about 100 MB a frame, nearly all of it
+/// unchanged, and XXH3 does that as fast as one core reads memory.
+fn content_hash(bytes: &[u8]) -> u128 {
+    twox_hash::XxHash3_128::oneshot(bytes)
+}
+
+#[cfg(test)]
+mod change_tests;
+
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
@@ -52,7 +63,7 @@ pub(crate) struct Staging {
 /// with room to read the memory into.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<u128>,
     asked: u64,
     read: Vec<u8>,
 }
@@ -213,7 +224,7 @@ impl Staging {
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = content_hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
