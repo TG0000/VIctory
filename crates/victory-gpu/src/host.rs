@@ -1357,16 +1357,12 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
+///
+/// Through `ReadProcessMemory` too, whose destination the kernel checks as
+/// well: `WriteProcessMemory` first asks for the destination's protection
+/// (about 2 ms in the title's big pools, 160 to 180 ms per world frame).
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let write = |at: usize, n: usize| {
-        let from = src.wrapping_add(at - dst as usize);
-        let mut done = 0;
-        // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
-    };
+    let write = |at: usize, n: usize| read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
     if len == 0 || write(dst as usize, len) {
         return;
     }
@@ -1378,6 +1374,9 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         }
     });
 }
+
+#[cfg(test)]
+mod write_back_tests;
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
 /// `step`.
