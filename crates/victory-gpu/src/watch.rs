@@ -108,11 +108,15 @@ struct Guards {
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
+    /// Blocks known to be view memory until remapped: asking at each check
+    /// of the world's big heap (~900 per frame) took 60 to 130 ms.
+    views: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
+    views: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -124,18 +128,23 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
-    if n == 0 || info.Type != MEM_MAPPED {
-        return None;
-    }
     install();
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let mut g = guards();
+    if !g.views.contains(&first) {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.Type != MEM_MAPPED {
+            return None;
+        }
+        let until = (info.BaseAddress as usize + info.RegionSize) / BLOCK;
+        g.views.insert(first);
+        g.views.extend(first..until.min(last));
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     for block in first..=last {
         let open = block < last && !g.clean.contains(&block);
         if open {
@@ -226,6 +235,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    let views = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    let views: Vec<usize> = g.views.range(views).copied().collect();
+    for block in views {
+        g.views.remove(&block);
     }
 }
 
@@ -324,6 +338,38 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// That memory is a view is remembered only until it is remapped.
+    #[test]
+    fn remapped_memory_is_asked_about_again() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let (first, second) = (view / BLOCK, view / BLOCK + 1);
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(vec![first, second]));
+        // The second block is known from the first one's asking.
+        assert!(guards().views.contains(&second));
+        assert_eq!(guard(view + BLOCK, view + 2 * BLOCK), Some(vec![]));
+        title_memory_remapped(view, 2 * BLOCK);
+        assert!(guards().views.range(first..=second).next().is_none());
+        // SAFETY: our view, unmapped once.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        assert_eq!(guard(view, view + 2 * BLOCK), None);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
